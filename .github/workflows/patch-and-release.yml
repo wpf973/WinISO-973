@@ -138,19 +138,21 @@ jobs:
           # 用 Latin-1 做字节级替换，只注释这两处退出等待，
           # 不改任何配置、补丁来源或集成逻辑，也不碰菜单用的 choice。
           $enc = [Text.Encoding]::GetEncoding(28591)
+          # W10UI.cmd 的 choice 后面紧跟 "if errorlevel 1 (goto :eof)"，
+          # 直接换成 goto :eof 最干净；Start.cmd 的 choice 后面本来就是 exit /b 0，注释掉即可。
           foreach ($pair in @(
-            @('W10UI.cmd', 'choice /c 9Q /n'),
-            @('Start.cmd', 'choice /c 7 /n')
+            @('W10UI.cmd', 'choice /c 9Q /n', 'goto :eof'),
+            @('Start.cmd', 'choice /c 7 /n', 'rem choice /c 7 /n')
           )) {
             $path  = Join-Path $dst $pair[0]
             $bytes = [IO.File]::ReadAllBytes($path)
             $text  = $enc.GetString($bytes)
             $count = ([regex]::Matches($text, [regex]::Escape($pair[1]))).Count
             if ($count -gt 0) {
-              $text = $text.Replace($pair[1], 'rem ' + $pair[1])
+              $text = $text.Replace($pair[1], $pair[2])
               [IO.File]::WriteAllBytes($path, $enc.GetBytes($text))
             }
-            Write-Host "$($pair[0]): 已屏蔽 $count 处退出按键等待"
+            Write-Host "$($pair[0]): 已处理 $count 处退出按键等待 -> $($pair[2])"
           }
           Push-Location $dst
           try {
