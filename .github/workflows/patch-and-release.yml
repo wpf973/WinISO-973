@@ -1,18 +1,21 @@
 name: 云端自动打补丁并发布
 
 # 用途：以已发布的「原始母盘」Release 为素材，在 GitHub 托管 Windows runner 上
-#       用 Win_ISO_Patching_Scripts 集成当月更新，一次产出两种格式并发布到同一个 Release：
-#         WIM（wim2esd=0，未压缩，生成快，先出）／ ESD（wim2esd=1，压缩，约小 25%，生成慢）
-#       客户在 Release 页面按文件名后缀自行选择下载。
+#       用 Win_ISO_Patching_Scripts 集成当月更新，产出两种格式并发布到同一个 Release。
+#
+# 串行方案（不并行、不重复集成）：
+#   1. wim2esd=0 集成一次，生成 WIM 版 ISO
+#   2. 打包并先发布 WIM 版，客户立即可下载
+#   3. 就地把 install.wim 转成 install.esd（wimlib export --compress=LZMS --solid）
+#   4. 用上游自带的 oscdimg 重建可启动 ESD 版 ISO
+#   5. 打包并追加发布 ESD 版到同一个 Release
 #
 # 关键设计：
-#   1. 两个 matrix job 并行、fail-fast=false，一个失败不影响另一个；WIM 天然先完成
-#   2. 不覆盖 W10UI.cmd —— 上游脚本仍在更新
-#   3. 不写死盘符，自动选择剩余空间最大的盘
-#   4. 集成后先移出成品 ISO，再删掉母盘/解压目录/补丁目录，压低磁盘峰值
-#   5. 用 REST API + curl 从工作目录直接上传，成品不必复制到 GITHUB_WORKSPACE
-#   6. 两个 job 共用一个 Release，创建时做并发兜底；各自只删/传自己后缀的附件
-#   7. 显式 permissions: contents: write
+#   1. 不覆盖 W10UI.cmd —— 上游脚本仍在更新
+#   2. 不写死盘符，自动选择剩余空间最大的盘
+#   3. 显式 permissions: contents: write
+#   4. 用 REST API + curl 从工作目录直接上传，成品不必复制到 GITHUB_WORKSPACE
+#   5. 上游脚本末尾的 choice 退出等待用字节级替换处理，CI 不会卡住
 
 on:
   workflow_dispatch:
@@ -43,25 +46,12 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 360
 
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: WIM
-            wim2esd: '0'
-            desc: '未压缩 install.wim，体积较大、生成快'
-          - variant: ESD
-            wim2esd: '1'
-            desc: '压缩 install.esd，约小 25%、生成慢'
-
     env:
       SOURCE_TAG: ${{ github.event.inputs.source_tag || 'Win10-2021-LTSC-IoT-x64' }}
       SOURCE_PREFIX: win10-2021-LTSC-IOT
       SOURCE_PARTS: '3'
       PROFILE: Win10-2021-LTSC-IoT-x64
       UPSTREAM_REPO: https://github.com/adavak/Win_ISO_Patching_Scripts.git
-      VARIANT: ${{ matrix.variant }}
-      WIM2ESD: ${{ matrix.wim2esd }}
 
     steps:
       - name: 检出本仓库
@@ -76,7 +66,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($v)) { $v = Get-Date -Format 'yyyy.MM' }
           "BUILD_VERSION=$v" >> $env:GITHUB_ENV
           "RELEASE_TAG=${{ env.PROFILE }}-$v" >> $env:GITHUB_ENV
-          Write-Host "变体: ${{ env.VARIANT }} (wim2esd=${{ env.WIM2ESD }}) | Release tag: ${{ env.PROFILE }}-$v"
+          Write-Host "Release tag: ${{ env.PROFILE }}-$v"
 
       - name: 选择空间最大的盘
         shell: pwsh
@@ -86,12 +76,12 @@ jobs:
           Write-Host "可用盘: $summary"
           $best = $drives[0]
           $free = [math]::Round($best.Free/1GB,1)
-          $root = Join-Path $best.Root ("WinISO-Build-${{ env.VARIANT }}")
+          $root = Join-Path $best.Root 'WinISO-Build'
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           "WORK_ROOT=$root" >> $env:GITHUB_ENV
           Write-Host "工作目录: $root (可用 $free GB)"
           if ($free -lt 25) {
-            Write-Warning "可用空间仅 $free GB；ISO 集成通常需要 25 GB 以上。若后续出现磁盘不足，请改用带大容量 D: 盘的镜像、GitHub larger runner 或自托管 runner。"
+            Write-Warning "可用空间仅 $free GB；ISO 集成通常需要 25 GB 以上。"
           }
 
       - name: 拉取 Win_ISO_Patching_Scripts
@@ -129,7 +119,7 @@ jobs:
           if ($isos.Count -ne 1) { throw "母盘 ISO 应为 1 个，实际 $($isos.Count) 个" }
           Write-Host "母盘: $($isos[0].Name)"
 
-      - name: 应用配置（按变体设置 wim2esd）
+      - name: 应用配置（本次生成 WIM 版）
         shell: pwsh
         run: |
           $dst = Join-Path $env:WORK_ROOT 'Win_ISO_Patching_Scripts'
@@ -137,19 +127,16 @@ jobs:
           if (-not (Test-Path $src)) { throw '缺少 config/W10UI.ini' }
           $target = Join-Path $dst 'W10UI.ini'
           Copy-Item -LiteralPath $src -Destination $target -Force
-          # 仓库里的 config/W10UI.ini 严格对齐上游（仅三项定制、wim2esd=1）。
-          # 这里只在本次运行时按 matrix 临时覆盖 wim2esd，不改仓库配置。
+          # 仓库配置严格对齐上游（wim2esd=1）。本次只在运行时临时设为 0，
+          # 先产出未压缩 WIM 版；ESD 版随后由同一次构建的结果转换得到。
           $lines = [IO.File]::ReadAllLines($target)
           $hit = 0
           for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match '^wim2esd\s*=') {
-              $lines[$i] = "wim2esd       =${{ env.WIM2ESD }}"
-              $hit++
-            }
+            if ($lines[$i] -match '^wim2esd\s*=') { $lines[$i] = 'wim2esd       =0'; $hit++ }
           }
           if ($hit -eq 0) { throw 'W10UI.ini 中未找到 wim2esd 项' }
           [IO.File]::WriteAllLines($target, $lines, (New-Object System.Text.UTF8Encoding($false)))
-          Write-Host "变体 ${{ env.VARIANT }}: wim2esd=${{ env.WIM2ESD }}"
+          Write-Host '本次 wim2esd=0（WIM 版）'
           Get-Content -LiteralPath $target |
             Where-Object { $_ -match '^\s*(AutoStart|nosuggtip|norestorage|nogamebar|wim2esd)\s*=' } |
             ForEach-Object { Write-Host "  $_" }
@@ -159,10 +146,7 @@ jobs:
         shell: pwsh
         run: |
           $dst = Join-Path $env:WORK_ROOT 'Win_ISO_Patching_Scripts'
-          # 上游 W10UI.cmd 末尾 "Press 9 or q to exit." + choice /c 9Q /n，
-          # Start.cmd 末尾 "Press 7 to exit." + choice /c 7 /n。
-          # CI 无交互 stdin，choice 会报 "The file is either empty or does not
-          # contain the valid choices" 并卡住。用 Latin-1 字节级替换只处理这两处。
+          # 上游 W10UI.cmd / Start.cmd 末尾的 choice 等待按键，CI 无交互 stdin 会卡死。
           $enc = [Text.Encoding]::GetEncoding(28591)
           foreach ($pair in @(
             @('W10UI.cmd', 'choice /c 9Q /n', 'goto :eof'),
@@ -186,109 +170,186 @@ jobs:
           if ($code -ne 0) { throw "Start.cmd 退出码 $code" }
           Write-Host '集成脚本执行完毕'
 
-      - name: 保留成品 ISO 并清理中间文件
+      - name: 取出 WIM 版 ISO 并准备转换目录
         shell: pwsh
         run: |
           $root   = $env:WORK_ROOT
           $dst    = Join-Path $root 'Win_ISO_Patching_Scripts'
           $mother = "${{ env.SOURCE_PREFIX }}.iso"
           $isos   = @(Get-ChildItem -LiteralPath $dst -Filter '*.iso' -File -Recurse | Where-Object { $_.Name -ne $mother })
-          if ($isos.Count -eq 0) { throw '未找到新生成的 ISO（Start.cmd 可能未真正执行）' }
+          if ($isos.Count -eq 0) { throw '未找到新生成的 ISO' }
           $iso    = $isos | Sort-Object Length -Descending | Select-Object -First 1
-          $final  = Join-Path $root $iso.Name
-          Move-Item -LiteralPath $iso.FullName -Destination $final -Force
-          Write-Host "成品: $($iso.Name)  $([math]::Round($iso.Length/1GB,2)) GiB"
-          "FINAL_ISO=$final" >> $env:GITHUB_ENV
-          "FINAL_ISO_NAME=$($iso.Name)" >> $env:GITHUB_ENV
-          Remove-Item -LiteralPath $dst -Recurse -Force -ErrorAction SilentlyContinue
+          $wimIso = Join-Path $root $iso.Name
+          Move-Item -LiteralPath $iso.FullName -Destination $wimIso -Force
+          Write-Host "WIM 版 ISO: $($iso.Name)  $([math]::Round($iso.Length/1GB,2)) GiB"
 
-      - name: 分卷打包并生成 SHA256
+          # 从 WIM ISO 解出完整内容目录，供后面替换 install.esd 后重建 ISO。
+          # 不依赖脚本内部目录是否保留，7-Zip 解出的内容同样含 boot/efi 启动文件。
+          $content = Join-Path $root 'esd-src'
+          & 7z.exe x $wimIso "-o$content" -y
+          if ($LASTEXITCODE -ne 0) { throw '解出 ISO 内容失败' }
+          if (-not (Test-Path -LiteralPath (Join-Path $content 'sources\install.wim'))) { throw '解出的目录中缺少 sources\install.wim' }
+          Write-Host "ISO 内容目录: $content"
+
+          # 释放空间：母盘、补丁、解压目录、临时目录，但保留 bin 工具（wimlib / oscdimg）
+          Remove-Item -LiteralPath (Join-Path $dst $mother) -Force -ErrorAction SilentlyContinue
+          foreach ($d in @('ISO','patch','W10UItemp','W10UImount','W10UImountre')) {
+            $p = Join-Path $dst $d
+            if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+          "WIM_ISO=$wimIso" >> $env:GITHUB_ENV
+          "ISO_CONTENT=$content" >> $env:GITHUB_ENV
+          "TOOLS=$dst" >> $env:GITHUB_ENV
+
+      - name: 打包 WIM 分卷
         shell: pwsh
         run: |
           $root    = $env:WORK_ROOT
-          $stem    = "${{ env.PROFILE }}-${{ env.BUILD_VERSION }}-${{ env.VARIANT }}"
+          $stem    = "${{ env.PROFILE }}-${{ env.BUILD_VERSION }}-WIM"
           $archive = Join-Path $root "$stem.7z"
-          & 7z.exe a -v1950M -mx=1 -y $archive $env:FINAL_ISO
-          if ($LASTEXITCODE -ne 0) { throw '分卷打包失败' }
-          Remove-Item -LiteralPath $env:FINAL_ISO -Force
+          & 7z.exe a -v1950M -mx=1 -y $archive $env:WIM_ISO
+          if ($LASTEXITCODE -ne 0) { throw 'WIM 分卷打包失败' }
+          Remove-Item -LiteralPath $env:WIM_ISO -Force
           $parts = @(Get-ChildItem -LiteralPath $root -Filter "$stem.7z.*" -File | Sort-Object Name)
           foreach ($p in $parts) { if ($p.Length -ge 2GB) { throw "$($p.Name) 超过 2 GiB 上限" } }
-          $sumName = "SHA256SUMS-${{ env.VARIANT }}.txt"
+          $sumName = 'SHA256SUMS-WIM.txt'
           $lines = foreach ($p in $parts) { "{0}  {1}" -f (Get-FileHash -LiteralPath $p.FullName -Algorithm SHA256).Hash.ToLower(), $p.Name }
           $lines | Set-Content -LiteralPath (Join-Path $root $sumName) -Encoding ASCII
-          "PARTS_DIR=$root" >> $env:GITHUB_ENV
-          "PART_GLOB=$stem.7z.*" >> $env:GITHUB_ENV
-          "SUMS_FILE=$sumName" >> $env:GITHUB_ENV
+          "WIM_GLOB=$stem.7z.*" >> $env:GITHUB_ENV
+          "WIM_SUMS=$sumName" >> $env:GITHUB_ENV
           $parts | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB)}} | Format-Table -AutoSize
 
-      - name: 创建或复用 Release
+      - name: 创建 Release 并先发布 WIM 版
         shell: pwsh
         run: |
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $h   = @{ Authorization = "Bearer ${{ github.token }}"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'WinISO-973-patcher' }
           $api = "${{ github.api_url }}/repos/${{ github.repository }}"
           $tag = "${{ env.RELEASE_TAG }}"
-          $rel = $null
-          try { $rel = Invoke-RestMethod -Uri "$api/releases/tags/$tag" -Headers $h -Method Get -UseBasicParsing }
-          catch {
-            $code = 0
-            if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
-            if ($code -ne 404) { throw "GitHub API $code : $($_.Exception.Message)" }
-          }
-          if (-not $rel) {
-            # 用数组拼接而非 here-string，保证每行都保持在 YAML 块缩进内
-            $notesLines = @(
-              '由 GitHub Actions 使用 Win_ISO_Patching_Scripts 自动集成当月更新。**本页提供两种版本，按需下载其中一种即可，不要混用分卷。**'
-              ''
-              '| 版本 | 文件后缀 | 特点 |'
-              '|---|---|---|'
-              '| WIM（未压缩） | `-WIM.7z.001` … + `SHA256SUMS-WIM.txt` | install.wim，体积较大、生成快，适合二次修改 |'
-              '| ESD（压缩） | `-ESD.7z.001` … + `SHA256SUMS-ESD.txt` | install.esd，体积约小 25%，生成慢，适合分发刻盘 |'
-              ''
-              'WIM 版通常先出现，ESD 版构建完成后会自动追加到本页。'
-              ''
-              '**使用方法**：把同一版本的全部分卷与对应 SHA256SUMS 下载到同一目录，用 7-Zip 打开 `.001` 解压得到 ISO。'
-              ''
-              "源母盘 Release: ${{ env.SOURCE_TAG }}"
-              "构建日期: $(Get-Date -Format 'yyyy-MM-dd')"
-            )
-            $notes = $notesLines -join "`n"
-            $payload = @{ tag_name = $tag; name = $tag; body = $notes; draft = $false; prerelease = $false } | ConvertTo-Json
-            $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
-            try {
-              $rel = Invoke-RestMethod -Uri "$api/releases" -Headers $h -Method Post -Body $bytes -ContentType 'application/json; charset=utf-8' -UseBasicParsing
-              Write-Host "已创建 Release id=$($rel.id)"
-            } catch {
-              # 两个 matrix job 并发时另一个可能刚创建，重新读取即可
-              Write-Host '并发创建冲突，改为读取已存在的 Release'
-              $rel = Invoke-RestMethod -Uri "$api/releases/tags/$tag" -Headers $h -Method Get -UseBasicParsing
-            }
-          } else {
-            Write-Host "复用已有 Release id=$($rel.id)"
-          }
+          $notesLines = @(
+            '由 GitHub Actions 使用 Win_ISO_Patching_Scripts 自动集成当月更新。**本页提供两种版本，按需下载其中一种即可，不要混用分卷。**'
+            ''
+            '| 版本 | 文件后缀 | 特点 |'
+            '|---|---|---|'
+            '| WIM（未压缩） | `-WIM.7z.001` … + `SHA256SUMS-WIM.txt` | install.wim，体积较大，先发布，适合二次修改 |'
+            '| ESD（压缩） | `-ESD.7z.001` … + `SHA256SUMS-ESD.txt` | install.esd，约小 25%，由同一次构建的 WIM 转换而来 |'
+            ''
+            'WIM 版先发布；ESD 版转换完成后会自动追加到本页。两者内容一致，仅安装映像压缩格式不同。'
+            ''
+            '**使用方法**：把同一版本的全部分卷与对应 SHA256SUMS 下载到同一目录，用 7-Zip 打开 `.001` 解压得到 ISO。'
+            ''
+            "源母盘 Release: ${{ env.SOURCE_TAG }}"
+            "上游 commit: ${{ env.UPSTREAM_SHA }}"
+            "构建日期: $(Get-Date -Format 'yyyy-MM-dd')"
+          )
+          $notes = $notesLines -join "`n"
+          $payload = @{ tag_name = $tag; name = $tag; body = $notes; draft = $false; prerelease = $false } | ConvertTo-Json
+          $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+          $rel = Invoke-RestMethod -Uri "$api/releases" -Headers $h -Method Post -Body $bytes -ContentType 'application/json; charset=utf-8' -UseBasicParsing
           "RELEASE_ID=$($rel.id)" >> $env:GITHUB_ENV
-          # 只删除本变体自己的同名旧附件，不影响另一个 job
-          $mine = @(Get-ChildItem -LiteralPath $env:PARTS_DIR -Filter $env:PART_GLOB -File) + @(Get-Item -LiteralPath (Join-Path $env:PARTS_DIR $env:SUMS_FILE))
-          $names = @($mine.Name)
-          foreach ($a in @($rel.assets)) {
-            if ($names -contains $a.name) {
-              Write-Host "删除本变体同名旧附件 $($a.name)"
-              Invoke-RestMethod -Uri "$api/releases/assets/$($a.id)" -Headers $h -Method Delete -UseBasicParsing | Out-Null
-            }
-          }
+          Write-Host "已创建 Release id=$($rel.id)"
 
-      - name: 上传分卷（自动发布）
-        shell: pwsh
-        run: |
-          $files = @(Get-ChildItem -LiteralPath $env:PARTS_DIR -Filter $env:PART_GLOB -File | Sort-Object Name) + @(Get-Item -LiteralPath (Join-Path $env:PARTS_DIR $env:SUMS_FILE))
+          $files = @(Get-ChildItem -LiteralPath $env:WORK_ROOT -Filter $env:WIM_GLOB -File | Sort-Object Name) + @(Get-Item -LiteralPath (Join-Path $env:WORK_ROOT $env:WIM_SUMS))
           foreach ($f in $files) {
             $n   = [uri]::EscapeDataString($f.Name)
-            $url = "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ env.RELEASE_ID }}/assets?name=$n"
-            Write-Host "上传 $($f.Name)"
+            $url = "https://uploads.github.com/repos/${{ github.repository }}/releases/$($rel.id)/assets?name=$n"
+            Write-Host "上传 WIM: $($f.Name)"
             & curl.exe -sS -f -X POST `
               -H "Authorization: Bearer ${{ github.token }}" `
               -H 'Content-Type: application/octet-stream' `
               --data-binary "@$($f.FullName)" $url | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "上传失败: $($f.Name)" }
           }
-          Write-Host "变体 ${{ env.VARIANT }} 发布完成: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ env.RELEASE_TAG }}"
+          # WIM 已发布，删掉本地分卷释放空间
+          foreach ($f in $files) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
+          Write-Host "WIM 版已发布: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag"
+
+      - name: WIM 转 ESD
+        timeout-minutes: 150
+        shell: pwsh
+        run: |
+          $content = $env:ISO_CONTENT
+          $tools   = $env:TOOLS
+          $wim = Join-Path $content 'sources\install.wim'
+          $esd = Join-Path $content 'sources\install.esd'
+          if (-not (Test-Path -LiteralPath $wim)) { throw '找不到 install.wim' }
+          Write-Host "转换前 install.wim: $([math]::Round((Get-Item $wim).Length/1GB,2)) GiB"
+          $wimlib = Join-Path $tools 'bin\bin64\wimlib-imagex.exe'
+          if (-not (Test-Path $wimlib)) { $wimlib = Join-Path $tools 'bin\wimlib-imagex.exe' }
+          if (-not (Test-Path $wimlib)) { throw '找不到 wimlib-imagex.exe' }
+          Push-Location $content
+          try {
+            & $wimlib export 'sources\install.wim' all 'sources\install.esd' --compress=LZMS --solid
+            $code = $LASTEXITCODE
+          } finally { Pop-Location }
+          if ($code -ne 0 -or -not (Test-Path -LiteralPath $esd)) {
+            Write-Warning 'wimlib 转换失败，回退 DISM /Compress:Recovery'
+            & dism.exe /Export-Image "/SourceImageFile:$wim" /All "/DestinationImageFile:$esd" /Compress:Recovery
+            if ($LASTEXITCODE -ne 0) { throw 'WIM 转 ESD 失败' }
+          }
+          Remove-Item -LiteralPath $wim -Force
+          Write-Host "转换后 install.esd: $([math]::Round((Get-Item $esd).Length/1GB,2)) GiB"
+
+      - name: 重建可启动的 ESD 版 ISO
+        shell: pwsh
+        run: |
+          $content = $env:ISO_CONTENT
+          $tools   = $env:TOOLS
+          $oscdimg = Join-Path $tools 'bin\bin64\oscdimg.exe'
+          if (-not (Test-Path $oscdimg)) { $oscdimg = Join-Path $tools 'bin\oscdimg.exe' }
+          if (-not (Test-Path $oscdimg)) { throw '找不到 oscdimg.exe' }
+          $esdIso = Join-Path $env:WORK_ROOT ("${{ env.PROFILE }}-${{ env.BUILD_VERSION }}-ESD.iso")
+          # 用临时 .cmd 执行，避免 -bootdata 内嵌引号在 PowerShell 传参时被吃掉
+          $bat = Join-Path $env:WORK_ROOT 'make-esd-iso.cmd'
+          $q = '"'
+          $line = $q + $oscdimg + $q + ' -bootdata:2#p0,e,b' + $q + '.\boot\etfsboot.com' + $q + '#pEF,e,b' + $q + '.\efi\microsoft\boot\efisys.bin' + $q + ' -o -m -u2 -udfver102 -l' + $q + 'WIN10_LTSC2021' + $q + ' . ' + $q + $esdIso + $q
+          [IO.File]::WriteAllLines($bat, @('@echo off', "cd /d $q$content$q", $line), [Text.Encoding]::ASCII)
+          & cmd.exe /c "$q$bat$q"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $esdIso)) { throw 'oscdimg 重建 ISO 失败' }
+          "ESD_ISO=$esdIso" >> $env:GITHUB_ENV
+          Write-Host "ESD 版 ISO: $([math]::Round((Get-Item $esdIso).Length/1GB,2)) GiB"
+          Remove-Item -LiteralPath $content -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: 打包 ESD 分卷
+        shell: pwsh
+        run: |
+          $root    = $env:WORK_ROOT
+          $stem    = "${{ env.PROFILE }}-${{ env.BUILD_VERSION }}-ESD"
+          $archive = Join-Path $root "$stem.7z"
+          & 7z.exe a -v1950M -mx=1 -y $archive $env:ESD_ISO
+          if ($LASTEXITCODE -ne 0) { throw 'ESD 分卷打包失败' }
+          Remove-Item -LiteralPath $env:ESD_ISO -Force
+          $parts = @(Get-ChildItem -LiteralPath $root -Filter "$stem.7z.*" -File | Sort-Object Name)
+          foreach ($p in $parts) { if ($p.Length -ge 2GB) { throw "$($p.Name) 超过 2 GiB 上限" } }
+          $sumName = 'SHA256SUMS-ESD.txt'
+          $lines = foreach ($p in $parts) { "{0}  {1}" -f (Get-FileHash -LiteralPath $p.FullName -Algorithm SHA256).Hash.ToLower(), $p.Name }
+          $lines | Set-Content -LiteralPath (Join-Path $root $sumName) -Encoding ASCII
+          "ESD_GLOB=$stem.7z.*" >> $env:GITHUB_ENV
+          "ESD_SUMS=$sumName" >> $env:GITHUB_ENV
+          $parts | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB)}} | Format-Table -AutoSize
+
+      - name: 追加发布 ESD 版
+        shell: pwsh
+        run: |
+          $h   = @{ Authorization = "Bearer ${{ github.token }}"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'WinISO-973-patcher' }
+          $api = "${{ github.api_url }}/repos/${{ github.repository }}"
+          $tag = "${{ env.RELEASE_TAG }}"
+          $rel = Invoke-RestMethod -Uri "$api/releases/tags/$tag" -Headers $h -UseBasicParsing
+          $files = @(Get-ChildItem -LiteralPath $env:WORK_ROOT -Filter $env:ESD_GLOB -File | Sort-Object Name) + @(Get-Item -LiteralPath (Join-Path $env:WORK_ROOT $env:ESD_SUMS))
+          $names = @($files.Name)
+          foreach ($a in @($rel.assets)) {
+            if ($names -contains $a.name) {
+              Invoke-RestMethod -Uri "$api/releases/assets/$($a.id)" -Headers $h -Method Delete -UseBasicParsing | Out-Null
+            }
+          }
+          foreach ($f in $files) {
+            $n   = [uri]::EscapeDataString($f.Name)
+            $url = "https://uploads.github.com/repos/${{ github.repository }}/releases/$($rel.id)/assets?name=$n"
+            Write-Host "上传 ESD: $($f.Name)"
+            & curl.exe -sS -f -X POST `
+              -H "Authorization: Bearer ${{ github.token }}" `
+              -H 'Content-Type: application/octet-stream' `
+              --data-binary "@$($f.FullName)" $url | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "上传失败: $($f.Name)" }
+          }
+          Write-Host "两个版本均已发布: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag"
