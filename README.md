@@ -16,7 +16,7 @@ Windows 10 LTSC 2021 IoT x64 镜像：**原始母盘存档 + 云端自动集成�
 - **定时**：每月 15 日 03:17 UTC（北京 11:17），晚于微软补丁日
 - **手动**：Actions → 「云端自动打补丁并发布」→ Run workflow，可填 `build_version`、`source_tag`、`wim2esd`
 - **流程**：下载母盘 3 个分卷 → 克隆 `adavak/Win_ISO_Patching_Scripts` → 写入 `config/W10UI.ini` → `Start.cmd` 集成当月更新 → 分卷打包 → 自动创建新 Release
-- **关键配置**：`config/W10UI.ini` 里 `AutoStart=1` 保证无人值守；`wim2esd=0` 避免云端耗时过久（可在手动运行时填 `wim2esd=true` 打开）
+- **关键配置**：`config/W10UI.ini` 严格照抄上游 `adavak/Win_ISO_Patching_Scripts` 的 `W10UI.ini`，仅三项定制：`nosuggtip=1`、`norestorage=1`、`nogamebar=1`；`AutoStart=1` 来自上游，保证无人值守。工作流只做原样复制，不改写任何配置
 - **要求**：仓库 Actions 权限须为 `Read and write`；标准 runner 只有 14 GB 磁盘，若报磁盘不足需改用带大容量 D: 盘的镜像、larger runner 或自托管 runner
 
 > 公开仓库 60 天无任何提交会自动停用定时任务，届时去 Actions 页点 **Enable workflow** 恢复；定时只在默认分支 `main` 生效。
