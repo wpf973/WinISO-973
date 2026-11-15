@@ -126,10 +126,32 @@ jobs:
             Where-Object { $_ -match '^\s*(AutoStart|nosuggtip|norestorage|nogamebar|wim2esd)\s*=' } |
             ForEach-Object { Write-Host "  $_" }
 
-      - name: 集成当月更新（Start.cmd）
+      - name: 适配 CI 并集成当月更新（Start.cmd）
+        timeout-minutes: 210
         shell: pwsh
         run: |
           $dst = Join-Path $env:WORK_ROOT 'Win_ISO_Patching_Scripts'
+          # 上游 W10UI.cmd 末尾有 "Press 9 or q to exit." + choice /c 9Q /n，
+          # Start.cmd 末尾有 "Press 7 to exit." + choice /c 7 /n。
+          # CI 环境没有交互 stdin，choice 会报
+          # "The file is either empty or does not contain the valid choices" 并卡住。
+          # 用 Latin-1 做字节级替换，只注释这两处退出等待，
+          # 不改任何配置、补丁来源或集成逻辑，也不碰菜单用的 choice。
+          $enc = [Text.Encoding]::GetEncoding(28591)
+          foreach ($pair in @(
+            @('W10UI.cmd', 'choice /c 9Q /n'),
+            @('Start.cmd', 'choice /c 7 /n')
+          )) {
+            $path  = Join-Path $dst $pair[0]
+            $bytes = [IO.File]::ReadAllBytes($path)
+            $text  = $enc.GetString($bytes)
+            $count = ([regex]::Matches($text, [regex]::Escape($pair[1]))).Count
+            if ($count -gt 0) {
+              $text = $text.Replace($pair[1], 'rem ' + $pair[1])
+              [IO.File]::WriteAllBytes($path, $enc.GetBytes($text))
+            }
+            Write-Host "$($pair[0]): 已屏蔽 $count 处退出按键等待"
+          }
           Push-Location $dst
           try {
             & cmd.exe /c Start.cmd
