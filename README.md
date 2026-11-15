@@ -15,10 +15,10 @@ Windows 10 LTSC 2021 IoT x64 镜像：**原始母盘存档 + 云端自动集成�
 
 | 版本 | 文件名特征 | 特点 |
 |---|---|---|
-| **WIM（未压缩）** | `...-WIM.7z.001` … + `SHA256SUMS-WIM.txt` | 内含 `install.wim`；体积较大、生成快，适合后期二次修改、挂载提取 |
-| **ESD（压缩）** | `...-ESD.7z.001` … + `SHA256SUMS-ESD.txt` | 内含 `install.esd`；体积约小 25%，生成慢，适合分发、刻盘、部署 |
+| **WIM（未压缩）** | `...-WIM.7z.001` … + `SHA256SUMS-WIM.txt` | 内含 `install.wim`；体积较大、先发布，适合后期二次修改、挂载提取 |
+| **ESD（压缩）** | `...-ESD.7z.001` … + `SHA256SUMS-ESD.txt` | 内含 `install.esd`；体积约小 25%，由同一份 WIM 转换而来，适合分发、刻盘、部署 |
 
-WIM 版通常先出现在页面上，ESD 版构建完成后会自动追加到同一个 Release。两者内容一致，区别只在安装映像的压缩格式。
+WIM 版先发布，随后把同一份 `install.wim` 转成 `install.esd` 并重建可启动 ISO，ESD 版自动追加到同一个 Release。**只集成一次补丁**，两个版本内容一致，区别仅在安装映像的压缩格式。
 
 ## 下载与还原
 
@@ -34,9 +34,10 @@ WIM 版通常先出现在页面上，ESD 版构建完成后会自动追加到同
 
 - **定时**：每月 15 日 03:17 UTC（北京 11:17），晚于微软补丁日
 - **手动**：Actions → 「云端自动打补丁并发布」→ Run workflow，可填 `build_version`、`source_tag`
-- **双变体并行**：两个独立 job 同时跑，分别用 `wim2esd=0`（WIM）和 `wim2esd=1`（ESD），各自下载母盘并集成更新，产物上传到同一个 Release；`fail-fast=false`，一个失败不影响另一个
-- **流程**：下载母盘 3 个分卷 → 克隆 `adavak/Win_ISO_Patching_Scripts` → 复制 `config/W10UI.ini` 并按变体临时覆盖 `wim2esd` → `Start.cmd` 集成 → 分卷打包 + SHA256 → 自动创建/复用 Release 并上传
-- **配置**：仓库里的 `config/W10UI.ini` 严格照抄上游，仅三项定制：`nosuggtip=1`、`norestorage=1`、`nogamebar=1`；`AutoStart=1` 来自上游。两个 `wim2esd` 值只在运行时按 matrix 临时设置，**不改仓库配置文件**
+- **串行、只集成一次**：单个 job，`wim2esd=0` 集成一次生成 WIM 版 → 打包并**先发布 WIM** → 就地把 `install.wim` 用 `wimlib export --compress=LZMS --solid` 转成 `install.esd`（失败回退 DISM `/Compress:Recovery`）→ 用上游自带 `oscdimg` 重建可启动 ISO → 打包并追加发布 ESD 版到同一个 Release
+- **流程**：下载母盘 3 个分卷 → 克隆 `adavak/Win_ISO_Patching_Scripts` → 复制 `config/W10UI.ini` 并临时设 `wim2esd=0` → `Start.cmd` 集成 → 7z 解出 ISO 内容目录 → WIM 分卷 + SHA256 + 上传 → WIM 转 ESD → oscdimg 重建 ISO → ESD 分卷 + SHA256 + 上传
+- **配置**：仓库里的 `config/W10UI.ini` 严格照抄上游，仅三项定制：`nosuggtip=1`、`norestorage=1`、`nogamebar=1`；`AutoStart=1` 来自上游。`wim2esd=0` 只在本次运行时临时设置，**不改仓库配置文件**；ESD 版不靠改配置重跑集成，而是直接转换 WIM 结果
+- **容错**：即使 ESD 转换或重建失败，WIM 版此时已经发布，客户不受影响
 - **CI 适配**：上游脚本末尾有 `choice` 等待按键退出，无人值守会卡死；工作流在启动时用字节级替换处理这两处，不改集成逻辑
 - **要求**：仓库 Actions 权限为 `Read and write`；`windows-2022` 实测有 D: 147 GB，磁盘充足
 
